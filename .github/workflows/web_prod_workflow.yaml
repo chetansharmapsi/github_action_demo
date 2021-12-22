@@ -1,0 +1,109 @@
+# Worlflow for build and deploy web app
+
+name: Build and Deploy web prod
+on:
+  push:
+    tags: [ web_prod ]
+
+jobs:
+  # Job to create build version number
+  build_number_create:
+    name: Create Build number
+    runs-on: ubuntu-latest
+    outputs:
+      build_number: ${{ steps.buildnumber.outputs.build_number }}
+    steps:
+    - name: Generate build number
+      id: buildnumber
+      uses: anthromorphic-ai/build-number-generator@master
+      with:
+        token: ${{secrets.PAT}}
+
+  # Job to send slack notification for web build and deploy start
+  slackNotificationForPortalBuildAndDeployStart:
+    name: WEB APP - Slack Notification for web build and deploy start
+    runs-on: ubuntu-latest
+    needs: [ build_number_create ]
+    steps:
+    - uses: actions/checkout@v2
+    - name: Slack Notification
+      uses: rtCamp/action-slack-notify@v2.0.2
+      env:
+        SLACK_MESSAGE: 'Build ${{ needs.build_number_create.outputs.build_number }} for web (prod) ${{github.repository}} started.'
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_USERNAME: ${{ github.repository }}      
+        SLACK_TITLE: '${{ github.repository }} web (prod)'
+        SLACK_ICON: https://github.com/anthromorphic-ai.png?size=48
+
+  # Job to build web code and deploy web build at firebase
+  buildPortal:
+    name: WEB APP - Build and Deploy web
+    runs-on: ubuntu-latest
+    needs: [ build_number_create ]
+    outputs:
+      buildPortalJobStatus: ${{ job.status  }}
+    
+
+    steps:
+    - uses: actions/checkout@v2
+      name: Checkout project_repository
+      with: 
+        repository: project_repository/project
+        path: project
+        token: ${{ secrets.PAT }}
+
+    - name: Update version in YAML
+      run: sed -i 's/#{APP_VERSION}#/${{ needs.build_number_create.outputs.build_number }}/g' ./project/pubspec.yaml    
+
+    - uses: actions/setup-java@v1
+      with:
+        java-version: '12.x'
+
+    - uses: subosito/flutter-action@v1
+      name: Flutter action
+      with:
+        flutter-version: '2.2.0'
+        channel: stable
+
+
+    - run: flutter pub get
+      working-directory: ./project
+
+    - name: Build
+      run: |
+        flutter config --enable-web
+        echo '${{ secrets.PROD_ENV_WEB_FIREBASE_CONFIG }}' >| web_flavors/prod/firebaseConfig.js
+        cp web_flavors/prod/firebaseConfig.js web/firebaseConfig.js
+        flutter build web --release
+      working-directory: ./project 
+
+
+    - name: install firebase tools
+      run: |
+        sudo npm install -g firebase-tools
+    - name: set firebase alias
+      run: |
+        firebase use project --token ${{ secrets.FIREBASE_TOKEN }}   
+      working-directory: ./project    
+
+    - name: Firebase Deploy
+      run: |
+        firebase deploy --token ${{ secrets.FIREBASE_TOKEN }} --only hosting:prod
+      working-directory: ./project  
+
+  # Job to send slack notification for web Build and Deploy status
+  slackNotificationForPortalBuildAndDeployStatus:
+    name: WEB APP -  Slack Notification for project v2 web Build and Deploy status
+    runs-on: ubuntu-latest
+    needs: [ build_number_create, buildPortal ]
+    if: always()
+    steps:
+    - uses: actions/checkout@v2
+    - name: Slack Notification
+      uses: rtCamp/action-slack-notify@v2.0.2
+      env:
+        SLACK_MESSAGE: 'Build and Deploy ${{ needs.build_number_create.outputs.build_number }} for project web v2 (prod) ${{github.repository}} ${{needs.buildPortal.outputs.buildPortalJobStatus }}.'
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_USERNAME: ${{ github.repository }}      
+        SLACK_TITLE: '${{ github.repository }} project web v2 (prod)'
+        SLACK_ICON: https://github.com/anthromorphic-ai.png?size=48       

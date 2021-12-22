@@ -1,0 +1,258 @@
+# Worlflow for Managing versions, build, test, release Android app and iOS app
+
+name: Build and Deploy Android and iOS
+on:
+  push:
+    tags: [ mobile_prod ]
+
+jobs:
+  # Job to create build version number
+  build_number_create:
+    name: Create Build number
+    runs-on: ubuntu-latest
+    outputs:
+      build_number: ${{ steps.buildnumber.outputs.build_number }}
+    steps:
+    - name: Generate build number
+      id: buildnumber
+      uses: repository/build-number-generator@master
+      with:
+        token: ${{secrets.GITHUB_TOKEN}}
+
+  # Job to send slack notification for Android build start
+  slackNotificationForAndroidBuildStart:
+    name: Slack Notification for Android build start
+    runs-on: ubuntu-latest
+    needs: [ build_number_create ]
+    steps:
+    - uses: actions/checkout@v2
+    - name: Slack Notification
+      uses: rtCamp/action-slack-notify@v2.0.2
+      env:
+        SLACK_MESSAGE: 'Build ${{ needs.build_number_create.outputs.build_number }} for Android app (prod) ${{github.repository}} started.'
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_USERNAME: ${{ github.repository }}      
+        SLACK_TITLE: '${{ github.repository }} Android app (prod)'
+        SLACK_ICON: https://github.com/repository.png?size=48
+
+  # Job to handle android build
+  buildAndroid:
+    name: Build APK
+    runs-on: ubuntu-latest
+    needs: [ build_number_create ]
+    outputs:
+      buildAndroidJobStatus: ${{ job.status  }}
+    steps:
+    
+    - uses: actions/checkout@v2
+      name: Checkout project_repository
+      with: 
+        repository: repository/project
+        path: project
+        token: ${{ secrets.PAT }}
+
+
+    - name: print build number
+      run: echo ${{ needs.build_number_create.outputs.build_number  }}
+
+    - name: Replace content of android prod/google-service.json content with GitHub secret PROD_ENV_ANDROID_GOOGLE_SERVICE_JSON
+      run: echo '${{ secrets.PROD_ENV_ANDROID_GOOGLE_SERVICE_JSON }}' >| ./project/android/app/src/prod/google-services.json    
+    
+
+
+    - name: Update version in YAML
+      run: sed -i 's/#{APP_VERSION}#/${{ needs.build_number_create.outputs.build_number }}/g' ./project/pubspec.yaml
+    - name: Update KeyStore password in gradle properties
+      run: sed -i 's/#{KEY_STORE_PASSWORD}#/${{ secrets.ANDROID_KEY_STORE_PASSWORD }}/g' ./project/android/key.properties
+    - name: Update KeyStore key password in gradle properties
+      run: sed -i 's/#{KEY_PASSWORD}#/${{ secrets.ANDROID_KEY_PASSWORD }}/g' ./project/android/key.properties    
+    
+    - uses: actions/setup-java@v2
+      with:
+        distribution: 'adopt'
+        java-version: '8'
+
+    - run: echo $SIGNING_KEY | base64 -d > android/app/keystore/projectKeystore.jks
+      working-directory: ./project
+      env:
+        SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+
+    - uses: subosito/flutter-action@v1
+      name: Flutter action
+      with:
+        flutter-version: '2.2.0'
+        channel: stable
+
+    - run: flutter pub get
+      working-directory: ./project
+
+    - run: flutter build apk --release --split-per-abi --flavor prod
+      working-directory: ./project
+      env:
+        KEY_STORE_PASSWORD: ${{ secrets.ANDROID_KEY_STORE_PASSWORD }}
+        KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        ALIAS: ${{ secrets.ANDROID_ALIAS }}
+        KEY_PATH: projectKeystore.jks
+
+    - run: flutter build appbundle --flavor prod
+      working-directory: ./project
+    - name: Create a Release in GitHub
+      uses: ncipollo/release-action@v1
+      with:
+        artifacts: "./project/build/app/outputs/flutter-apk/*.apk,./project/build/app/outputs/apk/release/*.apk,./project/build/app/outputs/bundle/release/app-release.aab,./project/build/app/outputs/bundle/prodlRelease/app-prod-release.aab"
+        token: ${{ secrets.GITHUB_TOKEN }}
+        tag: v${{needs.build_number_create.outputs.build_number}}
+        commit: ${{ github.sha }}
+    - name: Upload app bundle
+      uses: actions/upload-artifact@v2
+      with:
+        name: appbundle
+        path: ./project/build/app/outputs/bundle/prodRelease/app-prod-release.aab
+
+
+  # Job to send slack notification for Android build status
+  slackNotificationForAndroidBuildStatus:
+    name: Slack Notification for Android build status
+    runs-on: ubuntu-latest
+    needs: [ build_number_create, buildAndroid ]
+    if: always()
+    steps:
+    - uses: actions/checkout@v2
+    - name: Slack Notification
+      uses: rtCamp/action-slack-notify@v2.0.2
+      env:
+        SLACK_MESSAGE: 'Build ${{ needs.build_number_create.outputs.build_number }} for Android app (prod) ${{github.repository}}  ${{needs.buildAndroid.outputs.buildAndroidJobStatus }}.'
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_USERNAME: ${{ github.repository }}      
+        SLACK_TITLE: '${{ github.repository }} Android app (prod)'
+        SLACK_ICON: https://github.com/repository.png?size=48   
+
+
+  # Job for handling Android app deploy at play store
+  releaseAndroid:
+    name: Release Android app to internal track
+    needs: [ buildAndroid ]
+    outputs:
+      releaseAndroidJobStatus: ${{ job.status  }}
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v1
+    - name: Get appbundle from artifacts
+      uses: actions/download-artifact@v2
+      with:
+        name: appbundle
+    - name: Release app to prod track
+      uses: r0adkll/upload-google-play@v1.0.15
+      with:
+        serviceAccountJsonPlainText: ${{ secrets.PLAYSTORE_ACCOUNT_KEY }}
+        packageName: com.mobile.app
+        releaseFiles: app-prod-release.aab
+        track: internal
+        whatsNewDirectory: distribution/whatsnew
+
+  # Job to send slack notification for Android app release status
+  slackNotificationForAndroidReleaseStatus:
+    name: Slack Notification for Android app release status
+    runs-on: ubuntu-latest
+    needs: [ build_number_create, releaseAndroid ]
+    if: always()
+    steps:
+    - uses: actions/checkout@v2
+    - name: Slack Notification
+      uses: rtCamp/action-slack-notify@v2.0.2
+      env:
+        SLACK_MESSAGE: 'Release ${{ needs.build_number_create.outputs.build_number }} for Android app (prod) ${{github.repository}}  ${{needs.releaseAndroid.outputs.releaseAndroidJobStatus }}.'
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_USERNAME: ${{ github.repository }}      
+        SLACK_TITLE: '${{ github.repository }} Android app (prod)'
+        SLACK_ICON: https://github.com/repository.png?size=48
+
+
+  # Job to send slack notification for iOS app build start
+  slackNotificationForiOSBuildStart:
+    name: Slack Notification for iOS app build start
+    runs-on: ubuntu-latest
+    needs: [ build_number_create ]
+    steps:
+    - uses: actions/checkout@v2
+    - name: Slack Notification
+      uses: rtCamp/action-slack-notify@v2.0.2
+      env:
+        SLACK_MESSAGE: 'Build ${{ needs.build_number_create.outputs.build_number }} for ios app (prod) ${{github.repository}} started.'
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_USERNAME: ${{ github.repository }}      
+        SLACK_TITLE: '${{ github.repository }} ios app (prod)'
+        SLACK_ICON: https://github.com/repository.png?size=48
+
+  # Job for handking iOS app build and deplot at testflight 
+  buildiOS:
+    name: Archive and Deploy ipa
+    runs-on: macOS-latest
+    needs: [ build_number_create ]
+    outputs:
+      buildiOSJobStatus: ${{ job.status  }}
+
+    steps:
+
+    - uses: actions/checkout@v2
+      name: Checkout project_repository
+      with: 
+        repository: repository/project
+        path: project_repository
+        token: ${{ secrets.PAT }}
+
+    - name: Replace content of ios prod_app/GoogleService-Info.plist content with GitHub secret PROD_ENV_IOS_GOOGLE_SERVICE_INFO_PLIST
+      run: echo '${{ secrets.PROD_ENV_IOS_GOOGLE_SERVICE_INFO_PLIST }}' >| ./project/ios/Runner/Firebase/prod_app/GoogleService-Info-prod.plist
+    
+    - name: Update version in YAML
+      run: sed -i -e 's/#{APP_VERSION}#/${{ needs.build_number_create.outputs.build_number }}/g' ./project/pubspec.yaml
+
+    - uses: actions/setup-java@v1
+      with:
+        java-version: '12.x'    
+    - uses: subosito/flutter-action@v1
+      with:
+        flutter-version: '2.2.0'
+        channel: stable
+    
+
+    - run: flutter pub get
+      working-directory: ./project
+
+    - run: flutter build ios --release --no-codesign --flavor prod
+      working-directory: ./project
+
+    - name: Run fastlane setup and build
+      working-directory: ./project/ios
+      env:
+        APPLE_ACCOUNT: ${{ secrets.APPLE_ACCOUNT }}
+        TEAM_ID: ${{ secrets.APPLE_ACCOUNT_TEAM_ID }}
+        PROVISION_PROFILE_FILE_PATH: "secrets/mobile_app.mobileprovision"
+        CERTIFICATE_FILE_PATH: "secrets/Certificates.p12"
+        SCHEME_NAME: "prod"
+        CONFIGURATION_NAME: "Release-prod"
+        APP_ID: "com.mobile.app"
+        APPLE_ID: "1122222333"
+        FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD: ${{ secrets.FASTLANE_APPLE_APPLICATION_SPECIFIC_PASSWORD }}
+      run: |
+        fastlane build --verbose
+
+        
+  # Job to send slack notification for iOS app Archive and Deploy status
+  slackNotificationForiOSBuildStatus:
+    name: Slack Notification for iOS app Archive and Deploy status
+    runs-on: ubuntu-latest
+    needs: [ build_number_create, buildiOS ]
+    if: always()
+    steps:
+    - uses: actions/checkout@v2
+    - name: Slack Notification
+      uses: rtCamp/action-slack-notify@v2.0.2
+      env:
+        SLACK_MESSAGE: 'Archive and Deploy ${{ needs.build_number_create.outputs.build_number }} for ios app (prod) ${{github.repository}} ${{needs.buildiOS.outputs.buildiOSJobStatus }}.'
+        SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+        SLACK_USERNAME: ${{ github.repository }}      
+        SLACK_TITLE: '${{ github.repository }} ios app (prod)'
+        SLACK_ICON: https://github.com/repository.png?size=48   
+
+ 
